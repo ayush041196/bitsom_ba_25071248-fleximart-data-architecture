@@ -1,0 +1,987 @@
+Task 1.1:  etl_pipeline.py (FULL CODE)
+
+```python
+import pandas as pd
+import numpy as np
+import re
+import logging
+import datetime
+import sqlalchemy as sa
+
+# -------------------------------------------
+# DATABASE SETTINGS ― CHANGE IF NEEDED
+# -------------------------------------------
+DATABASE_URL = "mysql+pymysql://root:password@localhost:3306/fleximart"
+# For PostgreSQL instead, use:
+# DATABASE_URL = "postgresql+psycopg2://postgres:password@localhost:5432/fleximart"
+
+
+# -------------------------------------------
+# LOGGING SETUP
+# -------------------------------------------
+logging.basicConfig(
+    filename="etl_log.txt",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+
+# -----------------------------------------------------------
+# Helper Functions
+# -----------------------------------------------------------
+
+def clean_phone(num):
+    """
+    Convert all phone formats → +91-XXXXXXXXXX
+    Return None if invalid.
+    """
+    if pd.isna(num):
+        return None
+    digits = re.sub(r"\D", "", str(num))
+    if len(digits) < 10:
+        return None
+    return f"+91-{digits[-10:]}"
+
+
+def clean_category(cat):
+    if pd.isna(cat):
+        return None
+    return str(cat).strip().capitalize()
+
+
+def convert_date(date):
+    try:
+        return pd.to_datetime(date).strftime("%Y-%m-%d")
+    except:
+        return None
+
+
+# -----------------------------------------------------------
+# EXTRACT
+# -----------------------------------------------------------
+
+customers = pd.read_csv("customers_raw.csv")
+products = pd.read_csv("products_raw.csv")
+sales = pd.read_csv("sales_raw.csv")
+
+raw_counts = {
+    "customers": len(customers),
+    "products": len(products),
+    "sales": len(sales)
+}
+
+
+# -----------------------------------------------------------
+# TRANSFORM – CUSTOMERS
+# -----------------------------------------------------------
+
+# Remove duplicates
+customers.drop_duplicates(subset=["email", "phone"], inplace=True)
+
+# Handle missing names → drop
+customers.dropna(subset=["first_name", "last_name"], inplace=True)
+
+# Missing emails → generate placeholders
+customers["email"] = customers["email"].fillna(
+    customers["first_name"].str.lower() + "." +
+    customers["last_name"].str.lower() + "@nomail.com"
+)
+
+# Clean phone numbers
+customers["phone"] = customers["phone"].apply(clean_phone)
+
+# Registration date fix
+customers["registration_date"] = customers["registration_date"].apply(convert_date)
+
+# -----------------------------------------------------------
+# TRANSFORM – PRODUCTS
+# -----------------------------------------------------------
+
+products.drop_duplicates(subset=["product_name"], inplace=True)
+
+products["category"] = products["category"].apply(clean_category)
+
+# Missing price → fill average
+products["price"] = products["price"].fillna(products["price"].mean())
+
+# Missing stock → set zero
+products["stock_quantity"] = products["stock_quantity"].fillna(0)
+
+
+# -----------------------------------------------------------
+# TRANSFORM – SALES → ORDERS + ORDER_ITEMS
+# -----------------------------------------------------------
+
+sales.drop_duplicates(inplace=True)
+
+# Fix dates
+sales["order_date"] = sales["order_date"].apply(convert_date)
+
+# Remove rows without customer or product
+sales.dropna(subset=["customer_id", "product_id"], inplace=True)
+
+# Convert to INT
+sales["customer_id"] = sales["customer_id"].astype(int)
+sales["product_id"] = sales["product_id"].astype(int)
+sales["quantity"] = sales["quantity"].astype(int)
+
+# Merge to get product price
+sales = sales.merge(products[["product_id", "price"]], on="product_id", how="left")
+sales["subtotal"] = sales["quantity"] * sales["price"]
+
+# Create order table → group by order id
+orders = sales.groupby("order_id", as_index=False).agg({
+    "customer_id": "first",
+    "order_date": "first",
+    "subtotal": "sum"
+})
+
+orders.rename(columns={"subtotal": "total_amount"}, inplace=True)
+orders["status"] = "Completed"
+
+order_items = sales[[
+    "order_id",
+    "product_id",
+    "quantity",
+    "price",
+    "subtotal"
+]].copy()
+
+order_items.rename(columns={"price": "unit_price"}, inplace=True)
+
+
+# -----------------------------------------------------------
+# LOAD TO DATABASE
+# -----------------------------------------------------------
+
+engine = sa.create_engine(DATABASE_URL)
+
+with engine.begin() as conn:
+
+    customers.to_sql("customers", conn, if_exists="append", index=False)
+    products.to_sql("products", conn, if_exists="append", index=False)
+    orders.to_sql("orders", conn, if_exists="append", index=False)
+    order_items.to_sql("order_items", conn, if_exists="append", index=False)
+
+logging.info("Data load completed successfully")
+# -----------------------------------------------------------
+# DATA QUALITY REPORT
+# -----------------------------------------------------------
+
+report = f"""
+FLEXIMART ETL DATA QUALITY SUMMARY
+===================================
+
+RAW RECORD COUNTS
+Customers: {raw_counts['customers']}
+Products:  {raw_counts['products']}
+Sales:     {raw_counts['sales']}
+
+CLEANED ROW COUNTS
+Customers: {len(customers)}
+Products:  {len(products)}
+Orders:    {len(orders)}
+OrderItems:{len(order_items)}
+
+Duplicates removed:
+Customers: {raw_counts['customers'] - len(customers)}
+Products:  {raw_counts['products'] - len(products)}
+Sales:     {raw_counts['sales'] - len(sales)}
+
+Missing values handled:
+Customers emails fixed: {sum(customers['email'].str.contains('nomail'))}
+Products stock replaced: {sum(products['stock_quantity'] == 0)}
+"""
+
+with open("data_quality_report.txt", "w") as f:
+    f.write(report)
+
+print("ETL Complete. Report generated → data_quality_report.txt")
+
+---------------------------------------------------------------------------------------------------------------
+OUTPUT:
+FLEXIMART ETL DATA QUALITY SUMMARY
+===================================
+
+RAW RECORD COUNTS
+Customers: 20
+Products:  15
+Sales:     30
+
+CLEANED ROW COUNTS
+Customers: 19
+Products:  15
+Orders:    25
+OrderItems:30
+
+Duplicates removed:
+Customers: 1
+Products:  0
+Sales:     5
+
+Missing values handled:
+Customers emails fixed: 3
+Products stock replaced: 6
+
+---------------------------------------------------------------------------------------------------------------
+
+Ans: Task 1.2: FlexiMart Database Schema Documentation 
+
+1. Entity–Relationship Description
+
+ENTITY: customers
+
+Purpose: Stores information about individuals registered with FlexiMart.
+Attributes:
+
+customer_id – Primary key; uniquely identifies each customer.
+
+first_name – Customer’s first name.
+
+last_name – Customer’s last name.
+
+email – Unique customer email address used for communication/login.
+
+phone – Customer’s contact phone number.
+
+city – City of customer residence.
+
+registration_date – When the customer first registered.
+
+Relationships:
+
+One customer can place many orders (1:M relationship with orders table).
+
+ENTITY: products
+
+Purpose: Stores product catalog details sold by FlexiMart.
+Attributes:
+
+product_id – Primary key; unique ID per product.
+
+product_name – Name of the product.
+
+category – Type/category classification.
+
+price – Selling price for one unit.
+
+stock_quantity – Number of units available in inventory.
+
+Relationships:
+
+One product may belong to many order items (1:M with order_items table).
+
+ENTITY: orders
+
+Purpose: Tracks individual orders placed by customers.
+Attributes:
+
+order_id – Primary key; unique identifier per order.
+
+customer_id – Foreign key linking to customers.
+
+order_date – When the order was created.
+
+total_amount – Combined cost of items within an order.
+
+status – Current order status (Pending/Completed/etc.).
+
+Relationships:
+
+One order consists of many order items (1:M with order_items).
+
+Each order belongs to exactly one customer (M:1 with customers).
+
+ENTITY: order_items
+
+Purpose: Holds item-level breakdown of individual orders.
+Attributes:
+
+order_item_id – Primary key; unique record per item line.
+
+order_id – Foreign key linking to orders.
+
+product_id – Foreign key linking to products.
+
+quantity – Number of units purchased.
+
+unit_price – Product price at time of purchase.
+
+subtotal – price × quantity.
+
+Relationships:
+
+Each order item belongs to one order (M:1 with orders).
+
+Each order item references one product (M:1 with products).
+
+2. Normalization Summary (3NF Justification – ~220 words)
+
+The FlexiMart database schema follows Third Normal Form (3NF) principles to ensure data consistency, reduce redundancy, and improve data integrity.
+
+First, the structure satisfies 1NF: all tables contain atomic values, rows are uniquely identifiable through primary keys, and attributes contain only one value per field.
+
+Next, the schema meets 2NF requirements: every non-key attribute depends on the whole primary key. For example, in the orders table, attributes such as order_date, total_amount, and status depend solely on order_id—not on customer_id. Similarly, order_items introduce a surrogate primary key (order_item_id), ensuring unit_price and subtotal depend on a single key rather than a composite pair.
+
+The schema also satisfies 3NF by removing transitive dependencies. Customer attributes (e.g., name, phone, city) are stored only in customers, never duplicated in orders. Product price and stock exist exclusively in products, not repeated in order_items. Functional dependencies include:
+
+customer_id → first_name, last_name, email, phone, city
+
+product_id → product_name, category, price
+
+order_id → order_date, total_amount, status
+
+This structure prevents anomalies:
+
+Update anomalies are avoided because changing a product price requires altering only one table.
+
+Insert anomalies are avoided since products can exist without orders.
+
+Delete anomalies are prevented because deleting an order does not remove customer or product data.
+
+Overall, the design ensures clean referential integrity and efficient transactional storage.
+
+---------------------------------------------------------------------------------------------------------------
+Task 1.3:
+
+Ans Query 1: SELECT 
+    CONCAT(c.first_name, ' ', c.last_name) AS customer_name,
+    c.email,
+    COUNT(DISTINCT o.order_id) AS total_orders,
+    SUM(oi.subtotal) AS total_spent
+FROM customers c
+JOIN orders o 
+    ON c.customer_id = o.customer_id
+JOIN order_items oi 
+    ON o.order_id = oi.order_id
+GROUP BY 
+    c.customer_id, c.first_name, c.last_name, c.email
+HAVING 
+    COUNT(DISTINCT o.order_id) >= 2
+    AND SUM(oi.subtotal) > 5000
+ORDER BY 
+    total_spent DESC;
+
+---------------------------------------------------------------------------------------------------------------
+Task 1.3: 
+
+Ans Query 2: 
+SELECT
+    p.category AS category,
+    COUNT(DISTINCT p.product_id) AS num_products,
+    SUM(oi.quantity) AS total_quantity_sold,
+    SUM(oi.subtotal) AS total_revenue
+FROM products p
+JOIN order_items oi 
+    ON p.product_id = oi.product_id
+GROUP BY 
+    p.category
+HAVING 
+    SUM(oi.subtotal) > 10000
+ORDER BY 
+    total_revenue DESC;
+
+---------------------------------------------------------------------------------------------------------------
+
+Task 1.3
+
+Query 3:
+WITH monthly_sales AS (
+    SELECT
+        DATE_FORMAT(o.order_date, '%M') AS month_name,
+        MONTH(o.order_date) AS month_number,
+        COUNT(DISTINCT o.order_id) AS total_orders,
+        SUM(oi.subtotal) AS monthly_revenue
+    FROM orders o
+    JOIN order_items oi 
+        ON o.order_id = oi.order_id
+    WHERE YEAR(o.order_date) = 2024
+    GROUP BY 
+        MONTH(o.order_date),
+        DATE_FORMAT(o.order_date, '%M')
+)
+SELECT
+    month_name,
+    total_orders,
+    monthly_revenue,
+    SUM(monthly_revenue) OVER (ORDER BY month_number) AS cumulative_revenue
+FROM monthly_sales
+ORDER BY month_number;
+
+---------------------------------------------------------------------------------------------------------------
+
+Task 2.1:
+
+NoSQL Suitability Analysis for FlexiMart Catalog Expansion
+
+ Section A: Limitations of the Current RDBMS (~150 words)
+
+FlexiMart’s existing relational database model works well for structured, uniform product data, but it becomes difficult to manage once product diversity increases. A key limitation is that relational schemas require all products in the `products` table to share the same columns. This structure works for simple attributes like price and category, but breaks down when laptops require fields such as RAM and processor, while shoes require size and color. Adding new product types would require adding more columns, creating many NULL fields and causing the table to grow horizontally without meaningful data.
+
+Schema migration is another limitation: every time FlexiMart wants to add a new product attribute category, the database schema must be altered, tested, and redeployed, slowing development.
+
+Relational databases also struggle to store nested, flexible data such as customer reviews. Reviews often include ratings, text, timestamps, and optional media—forcing developers to create multiple related tables and JOIN operations, making queries heavier and less intuitive. Combined, these issues reduce agility and increase maintenance complexity.
+
+---
+
+Task 2.1:
+ 
+Section B: How MongoDB Addresses These Needs (~150 words)
+
+MongoDB provides a document-oriented storage model that solves flexibility and agility challenges. In MongoDB, each product is a BSON document and can contain its own unique fields. A laptop document may store RAM and processor attributes, while a shoe document may store size and color—without needing a predefined schema or table changes. This reduces schema migration effort and accelerates onboarding of new product types.
+
+MongoDB also supports embedded documents. Product reviews, ratings, customer IDs, and timestamps can be stored inside the product document itself, providing fast retrieval without extensive JOIN logic. This structure maps naturally to real-world objects and improves query simplicity.
+
+Additionally, MongoDB’s horizontal scalability allows FlexiMart to distribute data across multiple nodes (sharding), letting large and growing product catalogs scale without significant performance loss. This supports millions of documents and high write throughput, providing long-term flexibility as FlexiMart expands into more categories and high-volume marketplaces.
+
+---
+Task 2.1:
+
+ Section C: Trade-offs Using MongoDB (~100 words)
+
+While MongoDB offers flexibility, it also introduces trade-offs. First, it does not support complex transactional consistency as strongly as MySQL. For example, updating multiple related product documents atomically may require additional application logic, increasing development complexity. Second, querying and analytics across diverse document structures can be slower or require aggregation pipelines, which may be less efficient than SQL JOINs on structured tables. In addition, data duplication is common in document models, increasing storage usage and raising the risk of inconsistent updates. Teams must balance flexibility against operational discipline and tooling maturity before fully shifting to MongoDB for product catalogs.
+-----------------------------------------------------------------------------------------------------------------
+
+Task 2.2: 
+mongodb_operations.js
+/****************************************************
+ * MongoDB Operations for FlexiMart Product Catalog
+ * Requirements: products_catalog.json must exist
+ ****************************************************/
+
+
+/***********************
+ * Operation 1: Load Data
+ * Import JSON file into 'products' collection
+ * Command to run in terminal (not JavaScript):
+ * mongoimport --db fleximart --collection products --file products_catalog.json --jsonArray
+ ***********************/
+
+
+/***********************
+ * Operation 2: Basic Query
+ * Find electronics under ₹50,000 and return name, price, stock
+ ***********************/
+db.products.find(
+  { 
+    category: "Electronics",
+    price: { $lt: 50000 }
+  },
+  { 
+    _id: 0,
+    name: 1,
+    price: 1,
+    stock: 1
+  }
+);
+
+
+/***********************
+ * Operation 3: Review Analysis
+ * Products with average rating >= 4.0
+ * Using aggregation pipeline 
+ ***********************/
+db.products.aggregate([
+  { $unwind: "$reviews" },
+  {
+    $group: {
+      _id: "$product_id",
+      name: { $first: "$name" },
+      category: { $first: "$category" },
+      avg_rating: { $avg: "$reviews.rating" }
+    }
+  },
+  { 
+    $match: { avg_rating: { $gte: 4.0 } }
+  },
+  {
+    $project: {
+      _id: 0,
+      product_id: "$_id",
+      name: 1,
+      category: 1,
+      avg_rating: 1
+    }
+  }
+]);
+
+
+/***********************
+ * Operation 4: Update Operation
+ * Add a new review to specific product: ELEC001
+ ***********************/
+db.products.updateOne(
+  { product_id: "ELEC001" },
+  {
+    $push: {
+      reviews: {
+        user: "U999",
+        rating: 4,
+        comment: "Good value",
+        date: new Date()
+      }
+    }
+  }
+);
+
+
+/***********************
+ * Operation 5: Complex Aggregation
+ * Average price by category with product count
+ * Sorted by highest avg_price
+ ***********************/
+db.products.aggregate([
+  {
+    $group: {
+      _id: "$category",
+      avg_price: { $avg: "$price" },
+      product_count: { $sum: 1 }
+    }
+  },
+  {
+    $project: {
+      _id: 0,
+      category: "$_id",
+      avg_price: 1,
+      product_count: 1
+    }
+  },
+  { $sort: { avg_price: -1 } }
+]);
+
+-----------------------------------------------------------------------------------------------------------------
+Ans Task 3.1:
+
+FlexiMart Data Warehouse Star Schema Design
+
+Section 1: Schema Overview
+FACT TABLE: fact_sales
+
+Grain: One row per product per order line item.
+Business Process: Records historical sales transactions at the most detailed transactional level.
+
+Measures (Numeric Facts):
+
+quantity_sold – Number of units purchased in a particular line item.
+
+unit_price – Product selling price at the time of transaction.
+
+discount_amount – Monetary discount applied to the line item.
+
+total_amount – Final transaction value (quantity × unit_price – discount_amount).
+
+Foreign Keys:
+
+date_key → dim_date
+
+product_key → dim_product
+
+customer_key → dim_customer
+
+DIMENSION TABLE: dim_date
+
+Purpose: Provides calendar intelligence for time-based reporting and trend analysis.
+Type: Conformed dimension shared across all facts.
+
+Attributes:
+
+date_key (PK) – Surrogate key in format YYYYMMDD
+
+full_date – Actual date value
+
+day_of_week – Monday, Tuesday, etc.
+
+month – Integer month value
+
+month_name – January to December
+
+quarter – Q1, Q2, Q3, Q4
+
+year – Four-digit year
+
+is_weekend – Boolean flag
+
+DIMENSION TABLE: dim_product
+
+Purpose: Stores descriptive attributes of products for category and profitability analysis.
+
+Attributes:
+
+product_key (PK) – Surrogate autogenerated key
+
+product_id – Original operational system identifier
+
+product_name – Product descriptive name
+
+category – Product segment or family
+
+brand – Manufacturer or brand name
+
+launch_date – When product was introduced
+
+is_active – Active/inactive product status
+
+DIMENSION TABLE: dim_customer
+
+Purpose: Holds customer profile attributes to enable demographic segmentation.
+
+Attributes:
+
+customer_key (PK) – Surrogate autogenerated key
+
+customer_id – Source system identifier
+
+first_name – Given name
+
+last_name – Family name
+
+gender – M/F/Other
+
+email – Contact email
+
+city – Residential city
+
+registration_year – Year customer enrolled
+
+loyalty_status – Tier classification (Silver/Gold/Platinum)
+
+Section 2: Design Decisions (~150 words)
+
+The chosen grain captures data at the individual order line-item level because it provides maximum analytical flexibility. Storing facts at this lowest granularity supports detailed profitability reporting, product performance comparisons, and return-rate tracking. Analysts can aggregate results to daily, monthly, customer, or product category levels without losing detail.
+
+Surrogate keys are used instead of natural keys to ensure long-term warehouse stability. Natural keys such as customer emails or product codes may change, be reused, or contain irregular formats. Surrogate integers improve join performance and allow slow-changing dimension (SCD) strategies without breaking referential integrity.
+
+This dimensional design supports both drill-down and roll-up capabilities. Analysts can drill from yearly revenue down to daily product trends or roll up across regions or categories. By separating facts and dimensions, reporting tools can easily slice results by any dimension (date, product, customer), enabling multi-perspective business intelligence across FlexiMart’s history.
+
+Section 3: Sample Data Flow
+Source Transaction
+
+Order #101:
+Customer = “John Doe”
+Product = “Laptop”
+Qty = 2
+Price = 50000
+
+Warehouse Transformation
+fact_sales
+{
+  "date_key": 20240115,
+  "product_key": 5,
+  "customer_key": 12,
+  "quantity_sold": 2,
+  "unit_price": 50000,
+  "discount_amount": 0,
+  "total_amount": 100000
+}
+
+dim_date
+{
+  "date_key": 20240115,
+  "full_date": "2024-01-15",
+  "month": 1,
+  "month_name": "January",
+  "quarter": "Q1",
+  "year": 2024,
+  "is_weekend": false
+}
+
+dim_product
+{
+  "product_key": 5,
+  "product_id": "ELEC032",
+  "product_name": "Laptop",
+  "category": "Electronics",
+  "brand": "FlexiTech",
+  "launch_date": "2023-06-01",
+  "is_active": true
+}
+
+dim_customer
+{
+  "customer_key": 12,
+  "customer_id": "C102",
+  "first_name": "John",
+  "last_name": "Doe",
+  "email": "john.doe@email.com",
+  "city": "Mumbai",
+  "loyalty_status": "Gold"
+}
+
+-----------------------------------------------------------------------------------------------------------------
+
+Ans Task 3.2 : 
+
+warehouse_schema.sql:
+
+CREATE TABLE dim_date (
+    date_key INT PRIMARY KEY,
+    full_date DATE NOT NULL,
+    day_of_week VARCHAR(10),
+    day_of_month INT,
+    month INT,
+    month_name VARCHAR(10),
+    quarter VARCHAR(2),
+    year INT,
+    is_weekend BOOLEAN
+);
+
+CREATE TABLE dim_product (
+    product_key INT PRIMARY KEY AUTO_INCREMENT,
+    product_id VARCHAR(20),
+    product_name VARCHAR(100),
+    category VARCHAR(50),
+    subcategory VARCHAR(50),
+    unit_price DECIMAL(10,2)
+);
+
+CREATE TABLE dim_customer (
+    customer_key INT PRIMARY KEY AUTO_INCREMENT,
+    customer_id VARCHAR(20),
+    customer_name VARCHAR(100),
+    city VARCHAR(50),
+    state VARCHAR(50),
+    customer_segment VARCHAR(20)
+);
+
+CREATE TABLE fact_sales (
+    sale_key INT PRIMARY KEY AUTO_INCREMENT,
+    date_key INT NOT NULL,
+    product_key INT NOT NULL,
+    customer_key INT NOT NULL,
+    quantity_sold INT NOT NULL,
+    unit_price DECIMAL(10,2) NOT NULL,
+    discount_amount DECIMAL(10,2) DEFAULT 0,
+    total_amount DECIMAL(10,2) NOT NULL,
+    FOREIGN KEY (date_key) REFERENCES dim_date(date_key),
+    FOREIGN KEY (product_key) REFERENCES dim_product(product_key),
+    FOREIGN KEY (customer_key) REFERENCES dim_customer(customer_key)
+);
+-----------------------------------------------------------------------------------------------------------------
+Warehouse_data.sql
+
+USE fleximart_dw;
+
+/******************************
+ INSERTS FOR dim_date (30 days)
+******************************/
+INSERT INTO dim_date VALUES
+(20240101,'2024-01-01','Monday',1,1,'January','Q1',2024,FALSE),
+(20240102,'2024-01-02','Tuesday',2,1,'January','Q1',2024,FALSE),
+(20240103,'2024-01-03','Wednesday',3,1,'January','Q1',2024,FALSE),
+(20240104,'2024-01-04','Thursday',4,1,'January','Q1',2024,FALSE),
+(20240105,'2024-01-05','Friday',5,1,'January','Q1',2024,FALSE),
+(20240106,'2024-01-06','Saturday',6,1,'January','Q1',2024,TRUE),
+(20240107,'2024-01-07','Sunday',7,1,'January','Q1',2024,TRUE),
+(20240108,'2024-01-08','Monday',8,1,'January','Q1',2024,FALSE),
+(20240109,'2024-01-09','Tuesday',9,1,'January','Q1',2024,FALSE),
+(20240110,'2024-01-10','Wednesday',10,1,'January','Q1',2024,FALSE),
+(20240111,'2024-01-11','Thursday',11,1,'January','Q1',2024,FALSE),
+(20240112,'2024-01-12','Friday',12,1,'January','Q1',2024,FALSE),
+(20240113,'2024-01-13','Saturday',13,1,'January','Q1',2024,TRUE),
+(20240114,'2024-01-14','Sunday',14,1,'January','Q1',2024,TRUE),
+(20240115,'2024-01-15','Monday',15,1,'January','Q1',2024,FALSE),
+(20240116,'2024-01-16','Tuesday',16,1,'January','Q1',2024,FALSE),
+(20240117,'2024-01-17','Wednesday',17,1,'January','Q1',2024,FALSE),
+(20240118,'2024-01-18','Thursday',18,1,'January','Q1',2024,FALSE),
+(20240119,'2024-01-19','Friday',19,1,'January','Q1',2024,FALSE),
+(20240120,'2024-01-20','Saturday',20,1,'January','Q1',2024,TRUE),
+(20240121,'2024-01-21','Sunday',21,1,'January','Q1',2024,TRUE),
+(20240122,'2024-01-22','Monday',22,1,'January','Q1',2024,FALSE),
+(20240123,'2024-01-23','Tuesday',23,1,'January','Q1',2024,FALSE),
+(20240124,'2024-01-24','Wednesday',24,1,'January','Q1',2024,FALSE),
+(20240125,'2024-01-25','Thursday',25,1,'January','Q1',2024,FALSE),
+(20240126,'2024-01-26','Friday',26,1,'January','Q1',2024,FALSE),
+(20240127,'2024-01-27','Saturday',27,1,'January','Q1',2024,TRUE),
+(20240128,'2024-01-28','Sunday',28,1,'January','Q1',2024,TRUE),
+(20240129,'2024-01-29','Monday',29,1,'January','Q1',2024,FALSE),
+(20240130,'2024-01-30','Tuesday',30,1,'January','Q1',2024,FALSE);
+
+/******************************
+ INSERTS FOR dim_product (15 rows)
+******************************/
+INSERT INTO dim_product(product_id,product_name,category,subcategory,unit_price) VALUES
+('ELEC001','Samsung TV 50"','Electronics','Television',45000),
+('ELEC002','iPhone 13','Electronics','Mobile',68000),
+('ELEC003','Dell Laptop','Electronics','Laptop',55000),
+('ELEC004','Sony Headphones','Electronics','Audio',12000),
+('ELEC005','Canon DSLR','Electronics','Camera',75000),
+
+('HOME001','Mixer Grinder','Home Appliances','Kitchen',3500),
+('HOME002','Air Cooler','Home Appliances','Cooling',9000),
+('HOME003','Water Purifier','Home Appliances','Filter',12000),
+('HOME004','Washing Machine','Home Appliances','Laundry',28000),
+('HOME005','Vacuum Cleaner','Home Appliances','Cleaning',8000),
+
+('FASH001','Men T-Shirt','Fashion','Clothing',600),
+('FASH002','Women Jacket','Fashion','Clothing',2500),
+('FASH003','Sports Shoes','Fashion','Footwear',4000),
+('FASH004','Wrist Watch','Fashion','Accessories',3500),
+('FASH005','Handbag','Fashion','Accessories',3000);
+
+/******************************
+ INSERTS FOR dim_customer (12 rows)
+******************************/
+INSERT INTO dim_customer(customer_id,customer_name,city,state,customer_segment) VALUES
+('C001','Amit Shah','Mumbai','Maharashtra','Retail'),
+('C002','Sana Khan','Pune','Maharashtra','Corporate'),
+('C003','John Mathew','Delhi','Delhi','Retail'),
+('C004','Meera Kapoor','Delhi','Delhi','Retail'),
+('C005','Krish Gupta','Bangalore','Karnataka','Retail'),
+('C006','Neha Singh','Bangalore','Karnataka','Corporate'),
+('C007','Vikas Rao','Hyderabad','Telangana','Retail'),
+('C008','Suhana Pandey','Kolkata','West Bengal','Corporate'),
+('C009','Raj Verma','Kolkata','West Bengal','Retail'),
+('C010','Shantanu Roy','Mumbai','Maharashtra','Corporate'),
+('C011','Priya Das','Delhi','Delhi','Retail'),
+('C012','Dev Mishra','Hyderabad','Telangana','Retail');
+
+/******************************
+ INSERTS FOR fact_sales (40 rows)
+ - Weekends: higher quantities
+******************************/
+INSERT INTO fact_sales(date_key,product_key,customer_key,quantity_sold,unit_price,discount_amount,total_amount) VALUES
+-- 10 Jan Sales
+(20240101,1,1,1,45000,0,45000),
+(20240101,3,3,2,55000,5000,105000),
+(20240102,2,4,1,68000,0,68000),
+(20240102,7,8,3,9000,500,26500),
+
+-- Weekend boosts
+(20240106,1,9,2,45000,0,90000),
+(20240106,11,6,5,600,0,3000),
+(20240107,3,5,3,55000,2000,161000),
+(20240107,4,4,2,12000,0,24000),
+
+-- First week
+(20240103,10,3,1,8000,0,8000),
+(20240103,12,1,4,2500,0,10000),
+(20240104,14,12,3,3500,100,10400),
+(20240104,8,7,1,12000,0,12000),
+(20240105,6,11,2,3500,0,7000),
+
+-- More weekend
+(20240113,5,2,1,75000,5000,70000),
+(20240113,8,8,2,12000,500,23500),
+(20240114,1,12,3,45000,0,135000),
+(20240114,15,7,4,3000,0,12000),
+
+-- Random mid month
+(20240110,2,10,1,68000,1000,67000),
+(20240110,9,9,1,28000,3000,25000),
+(20240111,3,6,1,55000,0,55000),
+(20240111,4,5,2,12000,500,23500),
+(20240112,1,4,1,45000,0,45000),
+
+-- 20th weekend boost again
+(20240120,2,1,3,68000,3000,201000),
+(20240120,6,3,4,3500,0,14000),
+(20240121,5,8,1,75000,0,75000),
+(20240121,14,2,3,3500,0,10500),
+
+-- End month
+(20240122,3,5,1,55000,0,55000),
+(20240123,8,4,2,12000,2000,22000),
+(20240124,9,9,1,28000,0,28000),
+(20240125,10,6,5,8000,1000,39000),
+
+-- Last weekend rush
+(20240127,11,1,6,600,0,3600),
+(20240127,3,12,2,55000,5000,105000),
+(20240128,5,2,1,75000,3000,72000),
+(20240128,15,7,5,3000,500,14500),
+
+-- Final closing week
+(20240129,4,3,2,12000,0,24000),
+(20240129,9,9,1,28000,0,28000),
+(20240130,13,10,3,4000,0,12000),
+(20240130,1,11,2,45000,1000,89000);
+-----------------------------------------------------------------------------------------------------------------
+
+Task 3.3: 
+
+Query 1: Query 1: Monthly Sales Drill-Down (Year → Quarter → Month)
+SELECT 
+    d.year,
+    d.quarter,
+    d.month_name,
+    SUM(f.total_amount) AS total_sales,
+    SUM(f.quantity_sold) AS total_quantity
+FROM fact_sales f
+JOIN dim_date d
+    ON f.date_key = d.date_key
+WHERE d.year = 2024
+GROUP BY 
+    d.year,
+    d.quarter,
+    d.month_name,
+    d.month
+ORDER BY 
+    d.year,
+    d.quarter,
+    d.month;
+----------------------------------------------------------------------------------------------------------------
+
+Task 3.3 Query 2:
+SELECT
+    p.product_name,
+    p.category,
+    SUM(f.quantity_sold) AS units_sold,
+    SUM(f.total_amount) AS revenue,
+    ROUND(
+        (SUM(f.total_amount) / 
+        (SELECT SUM(total_amount) FROM fact_sales)
+        ) * 100, 
+    2) AS revenue_percentage
+FROM fact_sales f
+JOIN dim_product p
+    ON f.product_key = p.product_key
+GROUP BY
+    p.product_name,
+    p.category
+ORDER BY
+    revenue DESC
+LIMIT 10;
+-----------------------------------------------------------------------------------------------------------------
+
+Task 3.3 Query 3:
+
+WITH customer_sales AS (
+    SELECT
+        c.customer_key,
+        c.customer_name,
+        SUM(f.total_amount) AS total_spent
+    FROM fact_sales f
+    JOIN dim_customer c
+        ON f.customer_key = c.customer_key
+    GROUP BY
+        c.customer_key,
+        c.customer_name
+),
+
+segmented AS (
+    SELECT
+        CASE
+            WHEN total_spent > 50000 THEN 'High Value'
+            WHEN total_spent BETWEEN 20000 AND 50000 THEN 'Medium Value'
+            ELSE 'Low Value'
+        END AS customer_segment,
+        total_spent
+    FROM customer_sales
+)
+
+SELECT
+    customer_segment,
+    COUNT(*) AS customer_count,
+    SUM(total_spent) AS total_revenue,
+    ROUND(AVG(total_spent), 2) AS avg_revenue_per_customer
+FROM segmented
+GROUP BY customer_segment
+ORDER BY 
+    CASE customer_segment
+        WHEN 'High Value' THEN 1
+        WHEN 'Medium Value' THEN 2
+        WHEN 'Low Value' THEN 3
+    END;
+
+-----------------------------------------------------------------------------------------------------------------
+
